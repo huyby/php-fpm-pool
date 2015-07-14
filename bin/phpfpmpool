@@ -1,0 +1,239 @@
+#!/bin/bash
+PHP_FPM_DIR='/etc/php5/fpm'
+POOL_CONFIG_DIR="$PHP_FPM_DIR/pool.d"
+POOL_TEMPLATE="$PHP_FPM_DIR/templates/pool.conf.tmpl"
+POOL_PORT_STORAGE="$PHP_FPM_DIR/poolport.storage"
+POOL_PORT_MIN=9000
+POOL_LOG_DIR='/data/log/php5-fpm'
+PHP_SESSION_DIR='/data/lib/php5'
+APACHE_CONFIG_TEMPLATE="$PHP_FPM_DIR/templates/apache.conf.tmpl"
+APACHE_VHOST_CONF_DIR='/etc/apache2/sites-available'
+SED=`which sed`
+
+# No point going any further if we're not running with sudoer
+if [ `whoami` != 'root' ]; then
+    echo "phpfpmpool requires super-user privileges to work."
+    exit 1
+fi
+
+if [ "$SUDO_USER" = "root" ]; then
+    echo "You must start this under your regular user account (not root) using sudo."
+    echo "Rerun using: sudo $0 $*"
+    exit 1
+fi
+
+# Prompt for Yes/No answer 
+# $1 - question
+# $2 - default answer (Y|N)
+ask() {
+    while true; do
+ 
+        if [ "${2:-}" = "Y" ]; then
+            prompt="Y/n"
+            default=Y
+        elif [ "${2:-}" = "N" ]; then
+            prompt="y/N"
+            default=N
+        else
+            prompt="y/n"
+            default=
+        fi
+        # Prompt
+        REPLY=`prompt "$1" $prompt`
+ 
+        # Default?
+        if [ -z "$REPLY" ]; then
+            REPLY=$default
+        fi
+ 
+        # Check if the reply is valid
+        case "$REPLY" in
+            Y*|y*) return 0 ;;
+            N*|n*) return 1 ;;
+        esac
+ 
+    done
+}
+
+# Prompt for an answer
+# $1 - question
+# $2 - default value (optional)
+prompt() {
+    QUESTION=$1
+
+    if [ ! -z "$2" ]; then
+        DEFAULT=$2
+        QUESTION="$QUESTION [$DEFAULT]"
+    fi
+
+    # Ask the question - use /dev/tty in case stdin is redirected from somewhere else
+    read -p "$QUESTION: " ANSWER </dev/tty
+
+    # Default?
+    if [ -z "$ANSWER" ]; then
+        ANSWER=$DEFAULT
+    fi
+    echo $ANSWER
+}
+
+# Help output
+usage()
+{
+  cat << __EOT
+Usage: sudo phpfpmpool <name> 
+Where <name> is the one-word PHP-FPM pool name (e.g. famous-be)
+
+Options:
+   -a <apachevhost.conf>: apache vhost configuration file. 
+   -u <username>: set a username used for running the php-fpm process, also used as owner when creating log and session directories. If omitted <name> is used as username.
+
+__EOT
+  exit 1
+}
+
+# Append proxy config to apache configuration file
+# $1 - path to config file
+# $2 - tcp port to use in configuration
+apache_config() {
+    if [ ! -e $1 ]; then
+        echo "Apache config: invalid file: $1"
+        return 1;
+    fi
+    if [ -z "$2" ]; then
+        echo "Apache config: missing port argument"
+        return 1;
+    fi
+    local docroot=`grep DocumentRoot $1 | awk '{print $2}' | sed -e 's/"//g'`
+
+    if [ -z "$docroot" ]; then
+        echo "Apache config: no 'DocumentRoot' defined, we need it to setup a proxy."
+        return 1;
+    fi
+    while IFS= read -r line; do
+        line=${line//@@PORT@@/$2}
+        line=${line//@@DOCROOT@@/$docroot}
+        $SED -i "/<\/VirtualHost>/ i $line" "$1"
+    done < "$APACHE_CONFIG_TEMPLATE"
+}
+
+# Get command options
+USERNAME=
+APACHE_VHOST_CONFIG=
+while getopts ":u:a:" OPTION
+do
+    case $OPTION in
+        u)
+            USERNAME=$OPTARG
+            ;;
+        a)
+            APACHE_VHOST_CONFIG=$OPTARG
+            ;;
+        ?)
+            usage
+            ;;
+    esac
+done
+shift $(($OPTIND - 1))
+
+# Get <name>
+if [ -z $1 ]; then
+    usage
+fi
+POOL_NAME=$1
+POOL_CONFIG="$POOL_CONFIG_DIR/$POOL_NAME.conf"
+
+if [ -e $POOL_CONFIG ]; then
+    echo "Pool configuration file $POOL_CONFIG already exists."
+    exit
+fi
+
+# Check if pool name isn't already used
+if grep -R -q -e "\[$POOL_NAME\]" $POOL_CONFIG_DIR ; then
+    echo "Pool name '$POOL_NAME' is already used in a pool configuration."
+    exit
+fi
+
+# If no user from option, use pool <name> as user name
+if [ -z $USERNAME ]; then
+    USERNAME=$1
+fi
+
+# Determine port number for TCP socket
+POOL_PORT_STORAGE_NR=
+if [ -e $POOL_PORT_STORAGE ]
+then
+	POOL_PORT_STORAGE_NR=`head -1 $POOL_PORT_STORAGE`
+fi
+if [ -z "$POOL_PORT_STORAGE_NR" ]; then
+    POOL_PORT_STORAGE_NR=$POOL_PORT_MIN
+else
+    POOL_PORT_STORAGE_NR=$((POOL_PORT_STORAGE_NR + 1))
+fi
+POOL_PORT=$POOL_PORT_STORAGE_NR
+POOL_PORT=$(prompt "Enter port number" $POOL_PORT)
+
+# Prevent typo's
+if ! [[ "$POOL_PORT" =~ [0-9]+ ]] || [[ $POOL_PORT -lt $POOL_PORT_MIN ]] 
+then
+	echo "Pool port number should be a valid number and at least $POOL_PORT_MIN."
+	exit
+fi
+
+# Check if port number isn't in use 
+if grep -R -q -e "127.0.0.1:$POOL_PORT" $POOL_CONFIG_DIR ; then
+    echo "TCP socket port number $POOL_PORT is already used in a pool configuration."
+    exit
+fi
+if lsof -i"@127.0.0.1:$POOL_PORT" > /dev/null ; then
+    echo "TCP socket with port number $POOL_PORT is used by another process."
+    exit
+fi
+
+# Setup config
+cp $POOL_TEMPLATE $POOL_CONFIG
+$SED -i "s/@@NAME@@/$POOL_NAME/g" $POOL_CONFIG
+$SED -i "s/@@USER@@/$USERNAME/g" $POOL_CONFIG
+$SED -i "s/@@PORT@@/$POOL_PORT/g" $POOL_CONFIG
+POOL_LOG_DIR="$POOL_LOG_DIR/$POOL_NAME"
+echo "Setup pool log directory: $POOL_LOG_DIR"
+mkdir $POOL_LOG_DIR
+chown $USERNAME $POOL_LOG_DIR
+PHP_SESSION_DIR="$PHP_SESSION_DIR/session_$POOL_NAME"
+echo "Setup php session directory: $PHP_SESSION_DIR"
+mkdir $PHP_SESSION_DIR
+chown $USERNAME $PHP_SESSION_DIR
+echo ""
+echo "Pool configuration '$POOL_NAME' created in $POOL_CONFIG."
+echo "Run 'start php5-fpm-pool POOL_CONFIG=$POOL_CONFIG' to start pool."
+
+# Store port number if matches proposed storage nr
+if [[ $POOL_PORT -eq $POOL_PORT_STORAGE_NR ]]; then
+    echo $POOL_PORT > $POOL_PORT_STORAGE
+fi
+
+# Spin pool?
+if ask 'Want to run the pool now?' 'Y'; then
+    if ! start php5-fpm-pool "POOL_CONFIG=$POOL_CONFIG"; then
+        echo "Uh oh, something went wrong, try to run 'service php5-fpm-pool check'. Or have a look in $POOL_LOG_DIR/pool.log"
+    fi
+fi
+
+# Setup Apache vhost config
+if [ -z "$APACHE_VHOST_CONFIG" ] && ask 'Add configuration to Apache vhost?' 'Y' ; then
+    APACHE_VHOST_CONFIG=$(prompt "Path or name of vhost configuration file" "$APACHE_VHOST_CONF_DIR/$POOL_NAME.conf")
+fi
+if [ ! -z "$APACHE_VHOST_CONFIG" ]; then
+    if ! [[ "$APACHE_VHOST_CONFIG" =~ \/.*$ ]]; then
+        echo "Looking for '$APACHE_VHOST_CONFIG' in $APACHE_VHOST_CONF_DIR"
+        APACHE_VHOST_CONFIG="$APACHE_VHOST_CONF_DIR/$APACHE_VHOST_CONFIG"
+    fi
+    if [ ! -e "$APACHE_VHOST_CONFIG" ]; then 
+        echo "Apache config file does not exist: $APACHE_VHOST_CONFIG"
+    else
+        apache_config $APACHE_VHOST_CONFIG $POOL_PORT
+        echo ""
+        echo "Added proxy configuration to $APACHE_VHOST_CONFIG"
+        echo "Run 'service apache2 reload' to apply changes."
+    fi
+fi
+
